@@ -57,13 +57,14 @@ struct Config {
 // MARK: - Shell
 
 @discardableResult
-func run(_ path: String, _ args: [String], stdin: String? = nil) -> (code: Int32, out: String) {
+/// `stderr: false` discards stderr — pfctl prints ALTQ notices there that would pollute query output.
+func run(_ path: String, _ args: [String], stdin: String? = nil, stderr: Bool = true) -> (code: Int32, out: String) {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: path)
     p.arguments = args
     let out = Pipe()
     p.standardOutput = out
-    p.standardError = out
+    p.standardError = stderr ? out : FileHandle.nullDevice
     let inp = Pipe()
     if stdin != nil { p.standardInput = inp }
     do { try p.run() } catch { return (-1, "\(error)") }
@@ -123,13 +124,22 @@ func activeVPNs(_ store: SCDynamicStore) -> [VPN] {
         guard parts.count == 5, let v = dsValue(store, key),
               let addrs = v["Addresses"] as? [String], !addrs.isEmpty,
               let ifname = v["InterfaceName"] as? String, if_nametoindex(ifname) != 0 else { continue }
-        let sid = String(parts[3])
-        if sid.hasPrefix("gpd") { // GlobalProtect publishes its tunnel as service "gpd.pan"
+        if parts[3].hasPrefix("gpd") { // GlobalProtect publishes its tunnel as service "gpd.pan"
             out.append(VPN(kind: "GlobalProtect", name: "GlobalProtect", interface: ifname))
-        } else if isWireGuardService(store, sid) { // WireGuard.app (Network Extension)
-            let name = dsValue(store, "Setup:/Network/Service/\(sid)")?["UserDefinedName"] as? String ?? "WireGuard"
-            out.append(VPN(kind: "WireGuard", name: name, interface: ifname))
         }
+    }
+
+    // WireGuard.app (Network Extension): the running tunnel is published under a fresh service ID
+    // unrelated to the configured one, so ask the NE connection status of each configured service.
+    for key in dsKeys(store, "Setup:/Network/Service/[^/]+/Interface") {
+        let parts = key.split(separator: "/")
+        guard parts.count == 5, isWireGuardService(store, String(parts[3])),
+              let conn = SCNetworkConnectionCreateWithServiceID(nil, String(parts[3]) as NSString as CFString, nil, nil),
+              SCNetworkConnectionGetStatus(conn) == .connected else { continue }
+        let ext = SCNetworkConnectionCopyExtendedStatus(conn) as? [String: Any]
+        let ifname = (ext?["IPv4"] as? [String: Any])?["InterfaceName"] as? String ?? "?"
+        let name = dsValue(store, "Setup:/Network/Service/\(parts[3])")?["UserDefinedName"] as? String ?? "WireGuard"
+        out.append(VPN(kind: "WireGuard", name: name, interface: ifname))
     }
     // wg-quick (wireguard-tools) writes /var/run/wireguard/<name>.name containing the utun name
     let wgRun = "/var/run/wireguard"
@@ -282,12 +292,12 @@ final class Firewall {
 
     func block(_ rules: String) throws {
         // If someone reloaded/flushed the main ruleset, our anchor would never be evaluated.
-        if !run(pfctl, ["-s", "rules"]).out.contains("anchor \"com.apple/*\"") {
+        if !run(pfctl, ["-s", "rules"], stderr: false).out.contains("anchor \"com.apple/*\"") {
             log("main pf ruleset lacks anchor \"com.apple/*\" — reloading /etc/pf.conf")
             run(pfctl, ["-f", "/etc/pf.conf"])
             loaded = nil
         }
-        if !run(pfctl, ["-s", "info"]).out.contains("Status: Enabled") || !FileManager.default.fileExists(atPath: tokenPath) {
+        if !run(pfctl, ["-s", "info"], stderr: false).out.contains("Status: Enabled") || !FileManager.default.fileExists(atPath: tokenPath) {
             let (_, out) = run(pfctl, ["-E"]) // reference-counted enable; prints "Token : <n>"
             if let line = out.split(separator: "\n").first(where: { $0.hasPrefix("Token") }),
                let tok = line.split(separator: ":").last?.trimmingCharacters(in: .whitespaces) {
@@ -295,7 +305,7 @@ final class Firewall {
             }
             loaded = nil
         }
-        let current = run(pfctl, ["-a", pfAnchor, "-s", "rules"]).out
+        let current = run(pfctl, ["-a", pfAnchor, "-s", "rules"], stderr: false).out
         if loaded != rules || !current.contains("block return out quick all") {
             let (code, out) = run(pfctl, ["-a", pfAnchor, "-f", "-"], stdin: rules)
             guard code == 0 else { loaded = nil; throw FirewallError(message: "pfctl failed: \(out.trimmingCharacters(in: .whitespacesAndNewlines))") }
@@ -305,7 +315,7 @@ final class Firewall {
     }
 
     func unblock() {
-        let current = run(pfctl, ["-a", pfAnchor, "-s", "rules"]).out
+        let current = run(pfctl, ["-a", pfAnchor, "-s", "rules"], stderr: false).out
         if loaded != nil || !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             run(pfctl, ["-a", pfAnchor, "-F", "all"])
             log("traffic allowed")
@@ -444,7 +454,9 @@ final class Daemon {
 
 func symbol(_ name: String, color: NSColor? = nil) -> NSImage? {
     guard var img = NSImage(systemSymbolName: name, accessibilityDescription: "VGuard") else { return nil }
-    if let color, let tinted = img.withSymbolConfiguration(.init(paletteColors: [color])) { img = tinted }
+    var cfg = NSImage.SymbolConfiguration(pointSize: 17, weight: .medium) // menu-bar default is ~15pt; 17 reads bigger
+    if let color { cfg = cfg.applying(.init(paletteColors: [color])) } // paletteColors must be non-empty!
+    if let scaled = img.withSymbolConfiguration(cfg) { img = scaled }
     img.isTemplate = color == nil // template = adapts to light/dark menu bar
     return img
 }

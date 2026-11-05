@@ -1,0 +1,18 @@
+[project]
+name = "vguard"
+version = "0.1.0"
+description = "Util to manage client policies on Keenetic router"
+readme = "README.md"
+license = "BSD-3-Clause"
+authors = ["Alexander Chaika"]
+keywords = ["macos", "keenetic"]
+
+[dependencies]
+skills = [
+    "https://github.com/manti-by/openwiki/tree/master/skills/wiki-agents-file",
+    "https://github.com/manti-by/openwiki/tree/master/skills/wiki-archive",
+    "https://github.com/manti-by/openwiki/tree/master/skills/wiki-consistency",
+    "https://github.com/manti-by/openwiki/tree/master/skills/wiki-dedup",
+    "https://github.com/manti-by/openwiki/tree/master/skills/wiki-sync",
+    "https://github.com/mattpocock/skills/tree/main/skills/engineering/code-review",
+]

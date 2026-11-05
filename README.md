@@ -62,9 +62,51 @@ The daemon starts at boot on its own; the tray app is only the UI.
 - `/Library/Application Support/VGuard/pause` — pause-until epoch (written via admin prompt)
 - `/var/log/vguard.log` — daemon log
 
-## Uninstall / emergency unblock
+## Pause / disable
+
+- **Pause**: tray menu → **Pause Protection for 5 Minutes… / 1 Hour…** (admin prompt);
+  blocking resumes automatically, or immediately via **Resume Protection**.
+- **Disable, keep installed** (stays off across reboots):
+
+  ```sh
+  sudo launchctl disable system/com.vguard.daemon
+  sudo launchctl bootout system/com.vguard.daemon   # stops it; it flushes its pf rules on exit
+  ```
+
+  Re-enable:
+
+  ```sh
+  sudo launchctl enable system/com.vguard.daemon
+  sudo launchctl bootstrap system /Library/LaunchDaemons/com.vguard.daemon.plist
+  ```
+
+  `bootout` alone stops it only until the next reboot.
+
+## Uninstall
 
 ```sh
-make uninstall-daemon                       # stops daemon, removes rules
-sudo pfctl -a com.apple/vguard -F all       # just flush the rules (daemon re-adds them within 10 s)
+make uninstall-daemon      # stop + delete the daemon, flush its pf rules
+pkill -f VGuard.app        # quit the tray app
+rm -rf /Applications/VGuard.app
+sudo rm -rf "/Library/Application Support/VGuard" /var/log/vguard.log /var/run/vguard.pftoken
+osascript -e 'tell application "System Events" to delete login item "VGuard"'   # if added
 ```
+
+Verify:
+
+```sh
+sudo launchctl print system/com.vguard.daemon   # → "Could not find service"
+sudo pfctl -a com.apple/vguard -s rules          # → empty
+```
+
+## Emergency unblock
+
+If traffic stays blocked (e.g. the daemon was force-killed, so its rules stayed loaded):
+
+```sh
+sudo pfctl -a com.apple/vguard -F all
+```
+
+If the daemon is still running it re-adds the rules within 10 s, so stop it first
+(see *Disable* above). pf itself may stay enabled with only Apple's default rules, which
+block nothing.

@@ -35,7 +35,8 @@ struct Config {
     var allowLAN = true
     var allowDNS = true
     var autoDiscover = true
-    var extraHosts: [String] = []
+    // "*.domain" entries match the whole DNS wildcard zone (e.g. GlobalProtect cloud)
+    var extraHosts: [String] = ["*.gpcloudservice.com"]
 
     static func load() -> Config {
         var c = Config()
@@ -208,6 +209,19 @@ func resolve(_ host: String) -> [String] {
         cur = ai.pointee.ai_next
     }
     return Array(Set(ips.filter { !$0.isEmpty })).sorted()
+}
+
+func isWildcardHost(_ s: String) -> Bool { s.hasPrefix("*.") && s.count > 2 }
+
+/// Wildcard hosts can't be matched by name in pf (the allow table holds IPs only). DNS wildcard
+/// zones answer ANY label, so probing random subdomains returns the service's IP pool; allow those.
+/// Rarely fails closed (no answer → nothing allowed), but a probe leaking a random hostname is fine.
+func resolveWildcard(_ domain: String) -> [String] {
+    var ips: [String] = []
+    for i in 0..<3 { // several probes to get the whole pool / addresses from multiple resolvers
+        ips += resolve("vguard-probe-\(i)-\(Int.random(in: 0...999_999)).\(domain)")
+    }
+    return Array(Set(ips)).sorted()
 }
 
 func tunnelInterfaces() -> [String] {
@@ -401,7 +415,7 @@ final class Daemon {
         let hs = hosts(Config.load())
         DispatchQueue.global(qos: .utility).async {
             var out: [String: [String]] = [:]
-            for h in hs { out[h] = resolve(h) }
+            for h in hs { out[h] = isWildcardHost(h) ? resolveWildcard(String(h.dropFirst(2))) : resolve(h) }
             DispatchQueue.main.async {
                 self.resolving = false
                 // keep previous IPs for hosts that failed to resolve this round (e.g. DNS hiccup)
@@ -614,12 +628,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.informativeText = """
         While no VPN is connected, all traffic is blocked except the hosts below, DHCP, \
         and (optionally) DNS and LAN. Add hosts your VPN needs to connect — e.g. the SSO / \
-        SAML login page — as a comma-separated list.
+        SAML login page — as a comma-separated list. Use "*.domain" to allow an entire \
+        DNS wildcard zone (e.g. GlobalProtect cloud endpoints).
 
         Auto-discovered VPN endpoints: \(discovered.isEmpty ? "none" : discovered.joined(separator: ", "))
         """
         let hosts = NSTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
-        hosts.placeholderString = "login.microsoftonline.com, example.okta.com"
+        hosts.placeholderString = "login.microsoftonline.com, *.gpcloudservice.com"
         hosts.stringValue = cfg.extraHosts.joined(separator: ", ")
         let lan = NSButton(checkboxWithTitle: "Allow local network (LAN, link-local, multicast)", target: nil, action: nil)
         lan.state = cfg.allowLAN ? .on : .off
@@ -663,7 +678,15 @@ if CommandLine.arguments.contains("--daemon") {
     print("Active VPNs: \(vpns.isEmpty ? "none" : vpns.map(\.label).joined(separator: ", "))")
     let hosts = Array(Set((cfg.autoDiscover ? discoveredEndpoints(store) : []) + cfg.extraHosts)).sorted()
     var ips: [String] = []
-    for h in hosts { let r = resolve(h); ips += r; print("Allowed: \(h) → \(r.joined(separator: ", "))") }
+    for h in hosts {
+        let r = isWildcardHost(h) ? resolveWildcard(String(h.dropFirst(2))) : resolve(h)
+        ips += r
+        var line = "Allowed: \(h) → \(r.joined(separator: ", "))"
+        if r.isEmpty && isWildcardHost(h) {
+            line += "   (zone has no DNS wildcard — auto-discovered endpoints and specific hostnames are used instead)"
+        }
+        print(line)
+    }
     print("Would block: \(vpns.isEmpty)\n--- pf rules for anchor \(pfAnchor) ---")
     print(Firewall().makeRules(cfg, allowIPs: Array(Set(ips)).sorted()), terminator: "")
 } else {
